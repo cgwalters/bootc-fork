@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use camino::Utf8Path;
 use ostree::glib;
 use ostree_container::OstreeImageReference;
 use ostree_ext::container as ostree_container;
@@ -46,6 +47,11 @@ where
     S: Serializer,
 {
     serializer.collect_str(value)
+}
+
+/// Convert a path to relative if it isn't already.
+pub(crate) fn ensure_relative_path(p: &Utf8Path) -> &Utf8Path {
+    p.as_str().trim_start_matches('/').into()
 }
 
 /// Run a command in the host mount namespace

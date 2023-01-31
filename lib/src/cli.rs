@@ -82,6 +82,8 @@ pub(crate) enum TestingOpts {
     RunPrivilegedIntegration {},
     /// Execute integration tests that target a not-privileged ostree container
     RunContainerIntegration {},
+    /// Create a root filesystem with our current binary and dependencies
+    PopulateRootFromSelf { target: Utf8PathBuf },
 }
 
 /// Deploy and upgrade via bootable container images.

@@ -35,6 +35,8 @@ mod install;
 #[cfg(feature = "install")]
 mod podman;
 #[cfg(feature = "install")]
+mod rootbuilder;
+#[cfg(feature = "install")]
 mod task;
 
 #[cfg(feature = "docgen")]

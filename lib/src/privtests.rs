@@ -2,6 +2,7 @@ use std::process::Command;
 
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std_ext::cap_std;
 use cap_std_ext::rustix;
 use fn_error_context::context;
 use rustix::fd::AsFd;
@@ -122,6 +123,10 @@ pub(crate) async fn run(opts: TestingOpts) -> Result<()> {
         }
         TestingOpts::RunContainerIntegration {} => {
             tokio::task::spawn_blocking(impl_run_container).await?
+        }
+        TestingOpts::PopulateRootFromSelf { target } => {
+            tokio::task::spawn_blocking(move || crate::rootbuilder::copy_self_to_root(target))
+                .await?
         }
     }
 }

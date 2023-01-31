@@ -29,9 +29,17 @@ use crate::utils::run_in_host_mountns;
 
 /// The default "stateroot" or "osname"; see https://github.com/ostreedev/ostree/issues/2794
 const STATEROOT_DEFAULT: &str = "default";
-
 /// Directory for transient runtime state
 const RUN_BOOTC: &str = "/run/bootc";
+const SGDISK: &str = "sgdisk";
+const MKFS_EXT4: &str = "mkfs.ext4";
+const MKFS_XFS: &str = "mkfs.xfs";
+const MKFS_FAT: &str = "mkfs.fat";
+const MKFS_BTRFS: &str = "mkfs.btrfs";
+/// Our external binary dependencies
+pub(crate) const BIN_DEPENDENCIES: &[&str] = &[SGDISK, MKFS_FAT];
+/// Our external optional binary dependencies
+pub(crate) const OPTIONAL_BIN_DEPENDENCIES: &[&str] = &[MKFS_EXT4, MKFS_XFS, MKFS_BTRFS];
 
 #[derive(clap::ValueEnum, Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum BlockSetup {
@@ -286,7 +294,12 @@ fn mkfs<'a>(
     opts: impl IntoIterator<Item = &'a str>,
 ) -> Result<uuid::Uuid> {
     let u = uuid::Uuid::new_v4();
-    let mut t = Task::new("Creating filesystem", &format!("mkfs.{fs}"));
+    let binname = match fs {
+        Filesystem::Xfs => MKFS_XFS,
+        Filesystem::Ext4 => MKFS_EXT4,
+        Filesystem::Btrfs => MKFS_BTRFS,
+    };
+    let mut t = Task::new("Creating filesystem", binname);
     match fs {
         Filesystem::Xfs => {
             t.cmd.arg("-m");
@@ -606,7 +619,7 @@ fn install_create_rootfs(state: &State, opts: InstallBlockDeviceOpts) -> Result<
     std::fs::create_dir_all(&bootfs)?;
 
     // Run sgdisk to create partitions.
-    let mut sgdisk = Task::new("Initializing partitions", "sgdisk");
+    let mut sgdisk = Task::new("Initializing partitions", SGDISK);
     // sgdisk is too verbose
     sgdisk.cmd.stdout(Stdio::null());
     sgdisk.cmd.arg("-Z");
@@ -714,7 +727,7 @@ fn install_create_rootfs(state: &State, opts: InstallBlockDeviceOpts) -> Result<
 
     // Create the EFI system partition, if applicable
     if let Some(espdev) = espdev {
-        Task::new("Creating ESP filesystem", "mkfs.fat")
+        Task::new("Creating ESP filesystem", MKFS_FAT)
             .args([espdev.as_str(), "-n", "EFI-SYSTEM"])
             .quiet_output()
             .run()?;
