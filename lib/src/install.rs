@@ -588,11 +588,17 @@ async fn initialize_ostree_root(state: &State, root_setup: &RootSetup) -> Result
 
     let stateroot = state.stateroot();
 
-    Task::new_and_run(
-        "Initializing ostree layout",
-        "ostree",
-        ["admin", "init-fs", "--modern", rootfs.as_str()],
-    )?;
+    let has_ostree = rootfs_dir.try_exists("ostree/repo")?;
+    if !has_ostree {
+        Task::new_and_run(
+            "Initializing ostree layout",
+            "ostree",
+            ["admin", "init-fs", "--modern", rootfs.as_str()],
+        )?;
+    } else {
+        println!("Reusing extant ostree layout");
+        let _ = crate::utils::open_dir_remount_rw(rootfs_dir, "sysroot".into())?;
+    }
 
     // And also label /boot AKA xbootldr, if it exists
     let bootdir = rootfs.join("boot");
@@ -617,9 +623,15 @@ async fn initialize_ostree_root(state: &State, root_setup: &RootSetup) -> Result
     let sysroot = ostree::Sysroot::new(Some(&gio::File::for_path(rootfs)));
     sysroot.load(cancellable)?;
 
-    sysroot
-        .init_osname(stateroot, cancellable)
-        .context("initializing stateroot")?;
+    let stateroot_exists = rootfs_dir.try_exists(format!("ostree/deploy/{stateroot}"))?;
+    if stateroot_exists {
+        anyhow::bail!("Cannot redeploy over extant stateroot {stateroot}");
+    } else {
+        Task::new("Initializing stateroot", "ostree")
+            .args(["admin", "os-init", stateroot, "--sysroot", "."])
+            .cwd(rootfs_dir)?
+            .run()?;
+    }
 
     let sysroot_dir = Dir::reopen_dir(&crate::utils::sysroot_fd(&sysroot))?;
 
@@ -740,6 +752,7 @@ async fn install_container(
     options.kargs = Some(kargs.as_slice());
     options.target_imgref = Some(&state.target_imgref);
     options.proxy_cfg = proxy_cfg;
+    options.no_clean = root_setup.has_ostree;
     let imgstate = crate::utils::async_task_with_spinner(
         "Deploying container image",
         ostree_container::deploy::deploy(&sysroot, stateroot, &src_imageref, Some(options)),
@@ -1511,7 +1524,8 @@ fn remove_all_in_dir_no_xdev(d: &Dir) -> Result<()> {
 
 #[context("Removing boot directory content")]
 fn clean_boot_directories(rootfs: &Dir) -> Result<()> {
-    let bootdir = rootfs.open_dir(BOOT).context("Opening /boot")?;
+    let bootdir =
+        crate::utils::open_dir_remount_rw(rootfs, BOOT.into()).context("Opening /boot")?;
     // This should not remove /boot/efi note.
     remove_all_in_dir_no_xdev(&bootdir)?;
     if ARCH_USES_EFI {
