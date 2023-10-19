@@ -109,6 +109,10 @@ fn boot_entry_from_deployment(
     deployment: &ostree::Deployment,
 ) -> Result<BootEntry> {
     let repo = &sysroot.repo();
+    let configmaps = crate::config::configs_for_deployment(sysroot, deployment)?
+        .into_iter()
+        .map(|v| v.name)
+        .collect();
     let (image, incompatible) = if let Some(origin) = deployment.origin().as_ref() {
         if let Some(image) = get_image_origin(origin)? {
             let image = ImageReference::from(image);
@@ -142,8 +146,10 @@ fn boot_entry_from_deployment(
     } else {
         (None, false)
     };
+
     let r = BootEntry {
         image,
+        configmaps,
         incompatible,
         pinned: deployment.is_pinned(),
         ostree: Some(crate::spec::BootEntryOstree {
@@ -230,9 +236,15 @@ pub(crate) fn get_status(
     let spec = staged
         .as_ref()
         .or(booted.as_ref())
-        .and_then(|entry| entry.image.as_ref())
-        .map(|img| HostSpec {
-            image: Some(img.image.clone()),
+        .and_then(|entry| {
+            if let Some(img) = entry.image.as_ref() {
+                Some(HostSpec {
+                    image: Some(img.image.clone()),
+                    configmap_sources: entry.configmaps.iter().cloned().collect(),
+                })
+            } else {
+                None
+            }
         })
         .unwrap_or_default();
     let mut host = Host::new(OBJECT_NAME, spec);
@@ -252,7 +264,7 @@ pub(crate) async fn status(opts: super::cli::StatusOpts) -> Result<()> {
             is_container: true,
             ..Default::default()
         };
-        let mut r = Host::new(OBJECT_NAME, HostSpec { image: None });
+        let mut r = Host::new(OBJECT_NAME, HostSpec::default());
         r.status = status;
         r
     } else {
