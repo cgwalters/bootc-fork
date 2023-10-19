@@ -16,9 +16,12 @@
 pub mod cli;
 pub(crate) mod deploy;
 mod lsm;
+mod ostree_generation;
 mod reexec;
 mod status;
 mod utils;
+
+pub(crate) mod config;
 
 #[cfg(feature = "internal-testing-api")]
 mod privtests;
