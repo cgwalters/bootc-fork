@@ -44,7 +44,7 @@ impl<'a> RequiredHostSpec<'a> {
             .image
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing image in specification"))?;
-        let configmaps = &spec.configmap_sources;
+        let configmaps = &spec.configmap;
         Ok(Self { image, configmaps })
     }
 }

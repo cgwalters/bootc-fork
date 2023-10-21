@@ -240,7 +240,7 @@ pub(crate) fn get_status(
             if let Some(img) = entry.image.as_ref() {
                 Some(HostSpec {
                     image: Some(img.image.clone()),
-                    configmap_sources: entry.configmaps.iter().cloned().collect(),
+                    configmap: entry.configmaps.iter().cloned().collect(),
                 })
             } else {
                 None

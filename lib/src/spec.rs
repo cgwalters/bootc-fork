@@ -30,7 +30,7 @@ pub struct HostSpec {
     /// The host image
     pub image: Option<ImageReference>,
     /// Attached configs
-    pub configmap_sources: Vec<String>,
+    pub configmap: Vec<String>,
 }
 
 /// Remote location for a configmap

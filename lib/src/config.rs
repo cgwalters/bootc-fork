@@ -5,7 +5,6 @@ use crate::deploy::RequiredHostSpec;
 use crate::k8sapitypes::ConfigMap;
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
-use cap_std::fs::Dir;
 use cap_std_ext::cap_std;
 use containers_image_proxy::ImageProxy;
 use fn_error_context::context;
@@ -14,7 +13,6 @@ use ostree_ext::oci_spec;
 use ostree_ext::prelude::{Cast, FileExt, InputStreamExtManual, ToVariant};
 use ostree_ext::{gio, glib, ostree};
 use ostree_ext::{ostree::Deployment, sysroot::SysrootLock};
-use rustix::fd::AsRawFd;
 use tokio::io::AsyncReadExt;
 
 /// The media type of a configmap stored in a registry as an OCI artifact
@@ -30,10 +28,12 @@ const CONFIGMAP_PREFIX_ANNOTATION_KEY: &str = "bootc.prefix";
 /// The default prefix for configmaps and secrets.
 const DEFAULT_MOUNT_PREFIX: &str = "etc";
 
-/// The key used to store the configmap metadata
-const CONFIGMAP_MANIFEST_KEY: &str = "bootc.configmap.metadata";
-/// The key used to store the etag from the HTTP request
-const CONFIGMAP_ETAG_KEY: &str = "bootc.configmap.etag";
+/// The location to find updates
+const CONFIGMAP_SOURCE_KEY: &str = "bootc.configmap.imgref";
+/// The key used to store the manifest
+const CONFIGMAP_MANIFEST_KEY: &str = "bootc.configmap.manifest";
+/// The key used to store the manifest digest
+const CONFIGMAP_MANIFEST_DIGEST_KEY: &str = "bootc.configmap.digest";
 
 /// Default to world-readable for configmaps
 const DEFAULT_MODE: u32 = 0o644;
@@ -48,6 +48,8 @@ pub(crate) struct ConfigSpec {
 
 pub(crate) struct ConfigMapObject {
     manifest: oci_spec::image::ImageManifest,
+    manifest_digest: String,
+    imgref: Option<String>,
     config: ConfigMap,
 }
 
@@ -182,46 +184,12 @@ async fn list(sysroot: &SysrootLock) -> Result<()> {
     Ok(())
 }
 
-fn load_config(sysroot: &SysrootLock, name: &str) -> Result<ConfigMap> {
-    let cancellable = gio::Cancellable::NONE;
-    let configref = name_to_ostree_ref(name)?;
-    let (r, rev) = sysroot.repo().read_commit(&configref, cancellable)?;
-    tracing::debug!("Inspecting {rev}");
-    let commitv = sysroot.repo().load_commit(&rev)?.0;
-    let commitmeta = commitv.child_value(0);
-    let commitmeta = &glib::VariantDict::new(Some(&commitmeta));
-    let cfgdata = commitmeta
-        .lookup_value(CONFIGMAP_MANIFEST_KEY, Some(glib::VariantTy::STRING))
-        .ok_or_else(|| anyhow!("Missing metadata key {CONFIGMAP_MANIFEST_KEY}"))?;
-    let cfgdata = cfgdata.str().unwrap();
-    let mut cfg: ConfigMap = serde_json::from_str(cfgdata)?;
-    let prefix = Utf8Path::new(get_prefix(&cfg).trim_start_matches('/'));
-    let d = r.child(prefix);
-    if let Some(v) = cfg.binary_data.as_mut() {
-        for (k, v) in v.iter_mut() {
-            let k = k.trim_start_matches('/');
-            d.child(k)
-                .read(cancellable)?
-                .into_read()
-                .read_to_end(&mut v.0)?;
-        }
-    }
-    if let Some(v) = cfg.data.as_mut() {
-        for (k, v) in v.iter_mut() {
-            let k = k.trim_start_matches('/');
-            d.child(k)
-                .read(cancellable)?
-                .into_read()
-                .read_to_string(v)?;
-        }
-    }
-    Ok(cfg)
-}
-
 async fn show(sysroot: &SysrootLock, name: &str) -> Result<()> {
-    let config = load_config(sysroot, name)?;
+    let cancellable = gio::Cancellable::NONE;
+    let oref = &name_to_ostree_ref(name)?;
+    let config = read_configmap_data(&sysroot.repo(), oref, cancellable)?;
     let mut stdout = std::io::stdout().lock();
-    serde_yaml::to_writer(&mut stdout, &config)?;
+    serde_yaml::to_writer(&mut stdout, &config.config)?;
     Ok(())
 }
 
@@ -251,16 +219,19 @@ async fn remove(sysroot: &SysrootLock, name: &str) -> Result<()> {
 #[context("Writing configmap")]
 fn write_configmap(
     sysroot: &SysrootLock,
-    sepolicy: Option<&ostree::SePolicy>,
-    spec: &ConfigSpec,
+    booted_deployment: &ostree::Deployment,
+    name: &str,
     cfgobj: &ConfigMapObject,
     cancellable: Option<&gio::Cancellable>,
 ) -> Result<()> {
     use crate::ostree_generation::{create_and_commit_dirmeta, write_file};
-    let name = spec.name.as_str();
-    tracing::debug!("Writing configmap {name}");
-    let oref = name_to_ostree_ref(&spec.name)?;
+
     let repo = &sysroot.repo();
+    let sepolicy =
+        ostree::SePolicy::from_commit(repo, booted_deployment.csum().as_str(), cancellable)?;
+    let sepolicy = Some(&sepolicy);
+    tracing::debug!("Writing configmap {name}");
+    let oref = name_to_ostree_ref(name)?;
     let tx = repo.auto_transaction(cancellable)?;
     let tree = &ostree::MutableTree::new();
     let dirmeta =
@@ -315,11 +286,27 @@ fn read_configmap_data(
     repo: &ostree::Repo,
     rev: &str,
     cancellable: Option<&gio::Cancellable>,
-) -> Result<ConfigMap> {
-    let root = repo.read_commit(rev, cancellable)?.0;
+) -> Result<ConfigMapObject> {
+    let (root, rev) = repo.read_commit(rev, cancellable)?;
     let reader = root.child("config.json").read(cancellable)?;
     let mut reader = reader.into_read();
-    serde_json::from_reader(&mut reader).map_err(anyhow::Error::msg)
+    let config = serde_json::from_reader(&mut reader).context("Parsing config.json")?;
+    let commitv = repo.load_commit(&rev)?.0;
+    let commitmeta = &glib::VariantDict::new(Some(&commitv.child_value(0)));
+    let manifest_bytes = commitmeta
+        .lookup::<String>(CONFIGMAP_MANIFEST_KEY)?
+        .ok_or_else(|| anyhow!("Missing metadata key {CONFIGMAP_MANIFEST_KEY}"))?;
+    let manifest = serde_json::from_str(&manifest_bytes).context("Parsing manifest")?;
+    let manifest_digest = commitmeta
+        .lookup::<String>(CONFIGMAP_MANIFEST_DIGEST_KEY)?
+        .ok_or_else(|| anyhow!("Missing metadata key {CONFIGMAP_MANIFEST_DIGEST_KEY}"))?;
+    let imgref = commitmeta.lookup::<String>(CONFIGMAP_SOURCE_KEY)?;
+    Ok(ConfigMapObject {
+        manifest,
+        manifest_digest,
+        imgref,
+        config,
+    })
 }
 
 #[context("Applying configmap")]
@@ -331,7 +318,8 @@ pub(crate) fn apply_configmap(
     cancellable: Option<&gio::Cancellable>,
 ) -> Result<()> {
     let oref = name_to_ostree_ref(name)?;
-    let map = &read_configmap_data(repo, &oref, cancellable)?;
+    let mapobj = &read_configmap_data(repo, &oref, cancellable)?;
+    let map = &mapobj.config;
     let dirmeta = crate::ostree_generation::create_and_commit_dirmeta(
         repo,
         "/etc/some-unshipped-config-file".into(),
@@ -398,8 +386,8 @@ async fn fetch_configmap(
     tracing::debug!("Fetching {imgref}");
     let imgref = imgref.to_string();
     let oimg = proxy.open_image(&imgref).await?;
-    let (digest, manifest) = proxy.fetch_manifest(&oimg).await?;
-    if previous_manifest_digest == Some(digest.as_str()) {
+    let (manifest_digest, manifest) = proxy.fetch_manifest(&oimg).await?;
+    if previous_manifest_digest == Some(manifest_digest.as_str()) {
         return Ok(None);
     }
     let layer = configmap_object_from_manifest(&manifest)?;
@@ -422,7 +410,12 @@ async fn fetch_configmap(
     driver?;
 
     let config: ConfigMap = serde_json::from_str(&configmap_blob).context("Parsing configmap")?;
-    Ok(Some(Box::new(ConfigMapObject { manifest, config })))
+    Ok(Some(Box::new(ConfigMapObject {
+        manifest,
+        manifest_digest,
+        imgref: imgref.to_string().into(),
+        config,
+    })))
 }
 
 /// Download a configmap.
@@ -476,18 +469,12 @@ async fn add(
     if spec.configmaps.iter().any(|v| v == name) {
         anyhow::bail!("Config with name '{name}' already attached");
     }
-    let spec = ConfigSpec {
-        name: name.to_owned(),
-        imgref: imgref.clone(),
-    };
     let oref = name_to_ostree_ref(name)?;
     tracing::trace!("configmap {name} => {oref}");
     // TODO use ostree_ext::tokio_util::spawn_blocking_cancellable_flatten(move |cancellable| {
     // once https://github.com/ostreedev/ostree/pull/2824 lands
-    write_configmap(sysroot, Some(&sepolicy), &spec, &cfgobj, cancellable)?;
+    write_configmap(sysroot, &booted_deployment, name, &cfgobj, cancellable)?;
     println!("Stored configmap: {name}");
-
-    spec.store(&origin);
 
     // let merge_commit = merge_deployment.csum();
     // let commit = require_base_commit(repo, &merge_commit)?;
@@ -506,33 +493,7 @@ async fn update_one_config(
     name: &str,
     proxy: &ImageProxy,
 ) -> Result<bool> {
-    let cancellable = gio::Cancellable::NONE;
-    let repo = &sysroot.repo();
-    let cfgspec = configs
-        .into_iter()
-        .find(|v| v.name == name)
-        .ok_or_else(|| anyhow::anyhow!("No config with name {name}"))?;
-    let cfgref = cfgspec.ostree_ref()?;
-    let cfg_commit = repo.require_rev(&cfgref)?;
-    let cfg_commitv = repo.load_commit(&cfg_commit)?.0;
-    let cfg_commitmeta = glib::VariantDict::new(Some(&cfg_commitv.child_value(0)));
-    let etag = cfg_commitmeta
-        .lookup::<String>(CONFIGMAP_ETAG_KEY)?
-        .ok_or_else(|| anyhow!("Missing {CONFIGMAP_ETAG_KEY}"))?;
-    let cfgobj = match fetch_configmap(proxy, &cfgspec.imgref, Some(etag.as_str())).await? {
-        Some(v) => v,
-        None => {
-            return Ok(false);
-        }
-    };
-    let dirpath = sysroot.deployment_dirpath(merge_deployment);
-    // SAFETY: None of this should be NULL
-    let dirpath = sysroot.path().path().unwrap().join(dirpath);
-    let deployment_fd = Dir::open_ambient_dir(&dirpath, cap_std::ambient_authority())
-        .with_context(|| format!("Opening deployment directory {dirpath:?}"))?;
-    let sepolicy = ostree::SePolicy::new_at(deployment_fd.as_raw_fd(), cancellable)?;
-    write_configmap(sysroot, Some(&sepolicy), cfgspec, &cfgobj, cancellable)?;
-    Ok(true)
+    todo!()
 }
 
 async fn update<S: AsRef<str>>(
