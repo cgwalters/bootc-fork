@@ -476,12 +476,15 @@ async fn add(
     write_configmap(sysroot, &booted_deployment, name, &cfgobj, cancellable)?;
     println!("Stored configmap: {name}");
 
-    // let merge_commit = merge_deployment.csum();
-    // let commit = require_base_commit(repo, &merge_commit)?;
-    // let state = ostree_container::store::query_image_commit(repo, &commit)?;
-    // crate::deploy::deploy(sysroot, Some(merge_deployment), &stateroot, state, &origin).await?;
-    // crate::deploy::cleanup(sysroot).await?;
-    // println!("Queued changes for next boot");
+    let new_spec = {
+        let mut new_spec = host.spec.clone();
+        new_spec.configmap.push(name.to_owned());
+        new_spec
+    };
+    let new_spec = RequiredHostSpec::from_spec(&new_spec)?;
+    let stateroot = booted_deployment.osname();
+    let image = host.status.booted.as_ref().query_image();
+    crate::deploy::stage(sysroot, &stateroot, &fetched, &new_spec).await?;
 
     Ok(())
 }
