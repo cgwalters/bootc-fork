@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
-use crate::install::run_in_host_mountns;
+use crate::hostexec::run_in_host_mountns;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]

@@ -459,7 +459,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
         Opt::InstallToFilesystem(opts) => crate::install::install_to_filesystem(opts).await,
         #[cfg(feature = "install")]
         Opt::ExecInHostMountNamespace(args) => {
-            crate::install::exec_in_host_mountns(args.as_slice())
+            crate::hostexec::exec_in_host_mountns(args.as_slice())
         }
         Opt::Status(opts) => super::status::status(opts).await,
         #[cfg(feature = "internal-testing-api")]
