@@ -14,6 +14,7 @@
 #![deny(clippy::todo)]
 
 pub mod cli;
+mod composefs;
 pub(crate) mod deploy;
 pub(crate) mod hostexec;
 mod lsm;
