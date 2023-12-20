@@ -1,7 +1,9 @@
+use std::os::fd::BorrowedFd;
 use std::os::unix::prelude::OsStringExt;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use cap_std_ext::cap_std::fs::Dir;
 use ostree::glib;
 use ostree_ext::container::SignatureSource;
 use ostree_ext::ostree;
@@ -31,6 +33,13 @@ pub(crate) fn find_mount_option<'a>(
         .filter_map(|k| k.split_once('='))
         .filter_map(|(k, v)| (k == optname).then_some(v))
         .next()
+}
+
+/// Return a cap-std `Dir` referencing the OSTree system root.
+#[allow(unsafe_code)]
+pub(crate) fn sysroot_dir(sysroot: &ostree::Sysroot) -> Result<Dir> {
+    let fd = unsafe { BorrowedFd::borrow_raw(sysroot.fd()) };
+    Dir::reopen_dir(&fd).map_err(Into::into)
 }
 
 pub(crate) fn spawn_editor(tmpf: &tempfile::NamedTempFile) -> Result<()> {

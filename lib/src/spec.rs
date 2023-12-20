@@ -62,12 +62,16 @@ pub struct ImageReference {
 pub struct ImageStatus {
     /// The currently booted image
     pub image: ImageReference,
+
     /// The version string, if any
     pub version: Option<String>,
     /// The build timestamp, if any
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
     /// The digest of the fetched image (e.g. sha256:a0...);
     pub image_digest: String,
+
+    /// The Linux kernel version
+    pub kernel: String,
 }
 
 /// A bootable entry

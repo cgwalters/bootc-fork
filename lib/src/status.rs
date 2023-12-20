@@ -119,6 +119,7 @@ fn boot_entry_from_deployment(
     deployment: &ostree::Deployment,
 ) -> Result<BootEntry> {
     let repo = &sysroot.repo();
+    let sysroot_dir = &crate::utils::sysroot_dir(&sysroot)?;
     let (image, incompatible) = if let Some(origin) = deployment.origin().as_ref() {
         let incompatible = crate::utils::origin_has_rpmostree_stuff(origin);
         let image = if incompatible {
@@ -127,6 +128,19 @@ fn boot_entry_from_deployment(
         } else if let Some(image) = get_image_origin(origin)? {
             let image = ImageReference::from(image);
             let csum = deployment.csum();
+            let deployment_path = sysroot.deployment_dirpath(deployment);
+            let deployment_root = sysroot_dir.open_dir(deployment_path)?;
+            let kernel = ostree_ext::bootabletree::find_kernel_dir_fs(&deployment_root)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Failed to find kernel for deployment {}",
+                        deployment.index()
+                    )
+                })?;
+            let kernel = kernel
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Invalid kernel dir"))?
+                .into();
             let imgstate = ostree_container::store::query_image_commit(repo, &csum)?;
             let config = imgstate.configuration.as_ref();
             let labels = config.and_then(labels_of_config);
@@ -145,6 +159,7 @@ fn boot_entry_from_deployment(
                 version,
                 timestamp,
                 image_digest: imgstate.manifest_digest,
+                kernel,
             })
         } else {
             None
