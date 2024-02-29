@@ -1,0 +1,7 @@
+example
+.cosa
+_kola_temp
+bootc.tar.zst
+
+# Added by cargo
+/target
