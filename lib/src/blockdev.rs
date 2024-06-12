@@ -28,6 +28,7 @@ pub(crate) struct Device {
     pub(crate) label: Option<String>,
     pub(crate) fstype: Option<String>,
     pub(crate) children: Option<Vec<Device>>,
+    pub(crate) size: Option<String>,
 }
 
 impl Device {
