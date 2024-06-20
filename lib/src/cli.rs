@@ -11,6 +11,7 @@ use fn_error_context::context;
 use ostree::gio;
 use ostree_container::store::PrepareResult;
 use ostree_ext::container as ostree_container;
+use ostree_ext::container::Transport;
 use ostree_ext::keyfileext::KeyFileExt;
 use ostree_ext::ostree;
 use std::ffi::OsString;
@@ -174,6 +175,31 @@ pub(crate) enum ContainerOpts {
     Lint,
 }
 
+/// Subcommands which operate on images.
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub(crate) enum ImageOpts {
+    List,
+    /// Perform relatively inexpensive static analysis checks as part of a container
+    /// build.
+    ///
+    /// This is intended to be invoked via e.g. `RUN bootc container lint` as part
+    /// of a build process; it will error if any problems are detected.
+    Push {
+        /// The transport; e.g. oci, oci-archive, containers-storage.  Defaults to `registry`.
+        #[clap(long, default_value = "registry")]
+        transport: String,
+
+        #[clap(long)]
+        /// The source image; if not specified, the booted image will be used
+        source: Option<String>,
+
+        #[clap(long)]
+        /// The destination; if not specified, then the default is to push to `containers-storage:localhost/bootc`;
+        /// this will make the image accessible via e.g. `podman run localhost/bootc` and for builds.
+        target: Option<String>,
+    },
+}
+
 /// Hidden, internal only options
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InternalsOpts {
@@ -304,6 +330,12 @@ pub(crate) enum Opt {
     /// Operations which can be executed as part of a container build.
     #[clap(subcommand)]
     Container(ContainerOpts),
+    /// Operations on container images
+    ///
+    /// Stability: This interface is not declared stable and may change or be removed
+    /// at any point in the future.
+    #[clap(subcommand, hide = true)]
+    Image(ImageOpts),
     /// Execute the given command in the host mount namespace
     #[cfg(feature = "install")]
     #[clap(hide = true)]
@@ -714,6 +746,17 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                 let root = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
                 lints::lint(&root)?;
                 Ok(())
+            }
+        },
+        Opt::Image(opts) => match opts {
+            ImageOpts::List => crate::image::list_entrypoint().await,
+            ImageOpts::Push {
+                transport,
+                source,
+                target,
+            } => {
+                let transport = Transport::try_from(transport.as_str())?;
+                crate::image::push_entrypoint(transport, source.as_deref(), target.as_deref()).await
             }
         },
         #[cfg(feature = "install")]
