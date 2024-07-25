@@ -6,19 +6,29 @@ use anyhow::{Context, Result};
 use fn_error_context::context;
 use ostree_ext::container::{ImageReference, Transport};
 
+use crate::utils::CommandRunExt;
+
 /// The name of the image we push to containers-storage if nothing is specified.
 const IMAGE_DEFAULT: &str = "localhost/bootc";
 
 #[context("Listing images")]
 pub(crate) async fn list_entrypoint() -> Result<()> {
-    let sysroot = crate::cli::get_locked_sysroot().await?;
+    let sysroot = crate::cli::get_storage().await?;
     let repo = &sysroot.repo();
 
     let images = ostree_ext::container::store::list_images(repo).context("Querying images")?;
 
+    println!("# Host images");
     for image in images {
         println!("{image}");
     }
+    println!("");
+
+    println!("# Logically bound images");
+    let mut listcmd = sysroot.imgstore.new_image_cmd()?;
+    listcmd.arg("list");
+    listcmd.run()?;
+
     Ok(())
 }
 

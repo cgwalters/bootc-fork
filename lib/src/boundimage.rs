@@ -5,7 +5,6 @@
 //! pre-pulled (and in the future, pinned) before a new image root
 //! is considered ready.
 
-use crate::task::Task;
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use cap_std_ext::cap_std::fs::Dir;
@@ -13,7 +12,8 @@ use cap_std_ext::dirext::CapStdExtDirExt;
 use fn_error_context::context;
 use ostree_ext::containers_image_proxy;
 use ostree_ext::ostree::Deployment;
-use ostree_ext::sysroot::SysrootLock;
+
+use crate::store::Storage;
 
 /// The path in a root for bound images; this directory should only contain
 /// symbolic links to `.container` or `.image` files.
@@ -37,10 +37,10 @@ pub(crate) struct ResolvedBoundImage {
 }
 
 /// Given a deployment, pull all container images it references.
-pub(crate) fn pull_bound_images(sysroot: &SysrootLock, deployment: &Deployment) -> Result<()> {
+pub(crate) async fn pull_bound_images(sysroot: &Storage, deployment: &Deployment) -> Result<()> {
     let deployment_root = &crate::utils::deployment_fd(sysroot, deployment)?;
     let bound_images = query_bound_images(deployment_root)?;
-    pull_images(deployment_root, bound_images)
+    pull_images(sysroot, bound_images).await
 }
 
 #[context("Querying bound images")]
@@ -133,18 +133,17 @@ fn parse_container_file(file_contents: &tini::Ini) -> Result<BoundImage> {
     Ok(bound_image)
 }
 
-#[context("pull bound images")]
-pub(crate) fn pull_images(_deployment_root: &Dir, bound_images: Vec<BoundImage>) -> Result<()> {
+#[context("Pulling bound images")]
+pub(crate) async fn pull_images(sysroot: &Storage, bound_images: Vec<BoundImage>) -> Result<()> {
     tracing::debug!("Pulling bound images: {}", bound_images.len());
     //TODO: do this in parallel
     for bound_image in bound_images {
-        let mut task = Task::new("Pulling bound image", "/usr/bin/podman")
-            .arg("pull")
-            .arg(&bound_image.image);
-        if let Some(auth_file) = &bound_image.auth_file {
-            task = task.arg("--authfile").arg(auth_file);
-        }
-        task.run()?;
+        let image = &bound_image.image;
+        let desc = format!("Updating bound image: {image}");
+        crate::utils::async_task_with_spinner(&desc, async move {
+            sysroot.imgstore.pull(&bound_image.image).await
+        })
+        .await?;
     }
 
     Ok(())

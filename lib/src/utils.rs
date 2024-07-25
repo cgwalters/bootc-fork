@@ -15,17 +15,33 @@ pub(crate) trait CommandRunExt {
     fn run(&mut self) -> Result<()>;
 }
 
+/// If the exit status signals it was not successful, return an error.
+fn project_status(st: std::process::ExitStatus) -> Result<()> {
+    if !st.success() {
+        // Note that we intentionally *don't* include the command string
+        // in the output; we leave it to the caller to add that if they want,
+        // as it may be verbose.
+        anyhow::bail!(format!("Subprocess failed: {st:?}"))
+    }
+    Ok(())
+}
+
 impl CommandRunExt for Command {
     /// Synchronously execute the child, and return an error if the child exited unsuccessfully.
     fn run(&mut self) -> Result<()> {
-        let st = self.status()?;
-        if !st.success() {
-            // Note that we intentionally *don't* include the command string
-            // in the output; we leave it to the caller to add that if they want,
-            // as it may be verbose.
-            anyhow::bail!(format!("Subprocess failed: {st:?}"))
-        }
-        Ok(())
+        project_status(self.status()?)
+    }
+}
+
+/// Helpers intended for [`tokio::process::Command`].
+pub(crate) trait AsyncCommandRunExt {
+    async fn run(&mut self) -> Result<()>;
+}
+
+impl AsyncCommandRunExt for tokio::process::Command {
+    /// Synchronously execute the child, and return an error if the child exited unsuccessfully.
+    async fn run(&mut self) -> Result<()> {
+        project_status(self.status().await?)
     }
 }
 
@@ -214,4 +230,15 @@ fn test_sigpolicy_from_opts() {
 fn command_run_ext() {
     Command::new("true").run().unwrap();
     assert!(Command::new("false").run().is_err());
+}
+
+#[tokio::test]
+async fn async_command_run_ext() {
+    use tokio::process::Command as AsyncCommand;
+    let mut success = AsyncCommand::new("true");
+    let mut fail = AsyncCommand::new("false");
+    // Run these in parallel just because we can
+    let (success, fail) = tokio::join!(success.run(), fail.run(),);
+    success.unwrap();
+    assert!(fail.is_err());
 }

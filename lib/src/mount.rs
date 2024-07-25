@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
+use cap_std_ext::cap_std::fs::Dir;
 use fn_error_context::context;
 use serde::Deserialize;
 
@@ -65,6 +66,57 @@ pub(crate) fn mount(dev: &str, target: &Utf8Path) -> Result<()> {
         "mount",
         [dev, target.as_str()],
     )
+}
+
+pub(crate) struct TempMount {
+    dir: Option<tempfile::TempDir>,
+}
+
+impl TempMount {
+    #[context("Creating temp mount")]
+    pub(crate) fn new(srcd: &Dir) -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        Task::new_quiet("mount")
+            .args(["--bind", "."])
+            .arg(dir.path())
+            .cwd(srcd)?
+            .run()?;
+        Ok(Self { dir: Some(dir) })
+    }
+
+    pub(crate) fn path(&self) -> &Utf8Path {
+        // SAFETY: We don't expose an unset value except on drop
+        let dir = self.dir.as_ref().unwrap();
+        // SAFETY: We really expect utf-8 paths
+        dir.path().try_into().unwrap()
+    }
+
+    #[context("Closing temp mount")]
+    fn impl_close(&mut self) -> Result<()> {
+        let Some(dir) = self.dir.take() else {
+            return Ok(());
+        };
+        // We must recursively unmount because the storage stack
+        // creates a bind mount at the target by default.
+        Task::new_quiet("umount")
+            .args(["-R"])
+            .arg(dir.path())
+            .run()?;
+        dir.close()?;
+        Ok(())
+    }
+
+    // We expect users to pass this to close() which checks errors
+    pub(crate) fn close(mut self) -> Result<()> {
+        self.impl_close()
+    }
+}
+
+impl Drop for TempMount {
+    // But our drop is a last ditch effort
+    fn drop(&mut self) {
+        let _ = self.impl_close();
+    }
 }
 
 /// If the fsid of the passed path matches the fsid of the same path rooted

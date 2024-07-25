@@ -399,7 +399,7 @@ pub(crate) async fn stage(
     )
     .await?;
 
-    crate::boundimage::pull_bound_images(sysroot, &deployment)?;
+    crate::boundimage::pull_bound_images(sysroot, &deployment).await?;
 
     crate::deploy::cleanup(sysroot).await?;
     println!("Queued for next boot: {:#}", spec.image);

@@ -5,9 +5,10 @@
 //!
 //! This containers-storage: which canonically lives in `/sysroot/ostree/bootc`.
 
+use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
 use camino::Utf8Path;
 use cap_std_ext::cap_std::fs::Dir;
 use cap_std_ext::cmdext::CapStdExtCommandExt;
@@ -16,6 +17,7 @@ use fn_error_context::context;
 use std::os::fd::OwnedFd;
 
 use crate::task::Task;
+use crate::utils::{AsyncCommandRunExt, CommandRunExt};
 
 /// The path to the storage, relative to the physical system root.
 pub(crate) const SUBPATH: &str = "ostree/bootc/storage";
@@ -23,32 +25,46 @@ pub(crate) const SUBPATH: &str = "ostree/bootc/storage";
 /// relative to the /run directory
 const RUNROOT: &str = "bootc/storage";
 pub(crate) struct Storage {
-    root: Dir,
+    /// The root directory
+    sysroot: Dir,
+    /// The location of container storage
+    storage_root: Dir,
     #[allow(dead_code)]
+    /// Our runtime state
     run: Dir,
 }
 
 impl Storage {
-    fn podman_task_in(sysroot: OwnedFd, run: OwnedFd) -> Result<crate::task::Task> {
-        let mut t = Task::new_quiet("podman");
+    fn podman_cmd_in(sysroot: OwnedFd, run: OwnedFd) -> Result<Command> {
+        let mut t = Command::new("podman");
         // podman expects absolute paths for these, so use /proc/self/fd
         {
             let sysroot_fd: Arc<OwnedFd> = Arc::new(sysroot);
-            t.cmd.take_fd_n(sysroot_fd, 3);
+            t.take_fd_n(sysroot_fd, 3);
         }
         {
             let run_fd: Arc<OwnedFd> = Arc::new(run);
-            t.cmd.take_fd_n(run_fd, 4);
+            t.take_fd_n(run_fd, 4);
         }
-        t = t.args(["--root=/proc/self/fd/3", "--runroot=/proc/self/fd/4"]);
+        t.args(["--root=/proc/self/fd/3", "--runroot=/proc/self/fd/4"]);
         Ok(t)
     }
 
-    #[allow(dead_code)]
-    fn podman_task(&self) -> Result<crate::task::Task> {
-        let sysroot = self.root.try_clone()?.into_std_file().into();
+    /// Create a `podman image` Command instance prepared to operate on our alternative
+    /// root.
+    pub(crate) fn new_image_cmd(&self) -> Result<Command> {
+        let sysroot = self.storage_root.try_clone()?.into_std_file().into();
         let run = self.run.try_clone()?.into_std_file().into();
-        Self::podman_task_in(sysroot, run)
+        let mut r = Self::podman_cmd_in(sysroot, run)?;
+        // We want to limit things to only manipulating images.
+        r.arg("image");
+        Ok(r)
+    }
+
+    pub(crate) fn new_async_image_cmd(&self) -> Result<tokio::process::Command> {
+        let mut r = tokio::process::Command::from(self.new_image_cmd()?);
+        r.kill_on_drop(true);
+        Ok(r)
     }
 
     #[context("Creating imgstorage")]
@@ -64,7 +80,7 @@ impl Storage {
             // There's no explicit API to initialize a containers-storage:
             // root, simply passing a path will attempt to auto-create it.
             // We run "podman images" in the new root.
-            Self::podman_task_in(sysroot.open_dir(&tmp)?.into(), run.try_clone()?.into())?
+            Self::podman_cmd_in(sysroot.open_dir(&tmp)?.into(), run.try_clone()?.into())?
                 .arg("images")
                 .run()?;
             sysroot
@@ -76,10 +92,57 @@ impl Storage {
 
     #[context("Opening imgstorage")]
     pub(crate) fn open(sysroot: &Dir, run: &Dir) -> Result<Self> {
-        let root = sysroot.open_dir(SUBPATH).context(SUBPATH)?;
+        let storage_root = sysroot.open_dir(SUBPATH).context(SUBPATH)?;
         // Always auto-create this if missing
         run.create_dir_all(RUNROOT)?;
         let run = run.open_dir(RUNROOT).context(RUNROOT)?;
-        Ok(Self { root, run })
+        Ok(Self {
+            sysroot: sysroot.try_clone()?,
+            storage_root,
+            run,
+        })
+    }
+
+    /// Fetch the image if it is not already present; return whether
+    /// or not the image was fetched.
+    pub(crate) async fn pull(&self, image: &str) -> Result<bool> {
+        // Sadly https://docs.rs/containers-image-proxy/latest/containers_image_proxy/struct.ImageProxy.html#method.open_image_optional
+        // doesn't work with containers-storage yet
+        let mut cmd = self.new_async_image_cmd()?;
+        cmd.args(["exists", image]);
+        let exists = cmd.status().await?.success();
+        if exists {
+            // The image exists, false means we didn't pull it
+            Ok(false)
+        } else {
+            let mut cmd = self.new_async_image_cmd()?;
+            cmd.args(["pull", image]);
+            let authfile = ostree_ext::globals::get_global_authfile(&self.sysroot)?
+                .map(|(authfile, _fd)| authfile);
+            if let Some(authfile) = authfile {
+                cmd.args(["--authfile", authfile.as_str()]);
+            }
+            cmd.run().await.context("Failed to pull image")?;
+            Ok(true)
+        }
+    }
+
+    pub(crate) fn pull_from_host_storage(&self, image: &str) -> Result<()> {
+        // The skopeo API expects absolute paths, so we make a temporary bind
+        let temp_mount = crate::mount::TempMount::new(&self.storage_root)?;
+        let temp_mount_path = temp_mount.path();
+        // And an ephemeral place for the transient state
+        let tmp_runroot = tempfile::tempdir()?;
+        let tmp_runroot: &Utf8Path = tmp_runroot.path().try_into()?;
+
+        // The destination (target stateroot) + container storage dest
+        let storage_dest = &format!("containers-storage:[overlay@{temp_mount_path}+{tmp_runroot}]");
+        Task::new(format!("Copying image to target: {}", image), "podman")
+            .arg("push")
+            .arg(image)
+            .arg(format!("{storage_dest}{image}"))
+            .run()?;
+        temp_mount.close()?;
+        Ok(())
     }
 }
