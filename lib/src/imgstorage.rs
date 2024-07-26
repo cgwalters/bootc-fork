@@ -5,6 +5,7 @@
 //!
 //! This containers-storage: which canonically lives in `/sysroot/ostree/bootc`.
 
+use std::io::{Read, Seek};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -56,7 +57,7 @@ impl Storage {
         let sysroot = self.storage_root.try_clone()?.into_std_file().into();
         let run = self.run.try_clone()?.into_std_file().into();
         let mut r = Self::podman_cmd_in(sysroot, run)?;
-        // We want to limit things to only manipulating images.
+        // We want to limit things to only manipulating images by default.
         r.arg("image");
         Ok(r)
     }
@@ -65,6 +66,23 @@ impl Storage {
         let mut r = tokio::process::Command::from(self.new_image_cmd()?);
         r.kill_on_drop(true);
         Ok(r)
+    }
+
+    async fn run_podman_image_async<S>(&self, args: impl IntoIterator<Item = S>) -> Result<()>
+    where
+        S: AsRef<str>,
+    {
+        let mut cmd = self.new_async_image_cmd()?;
+        let mut stderr = tempfile::tempfile()?;
+        cmd.stderr(stderr.try_clone()?);
+        if let Err(e) = cmd.run().await {
+            stderr.seek(std::io::SeekFrom::Start(0))?;
+            let mut stderr_buf = String::new();
+            // Ignore errors
+            let _ = stderr.read_to_string(&mut stderr_buf);
+            return Err(anyhow::anyhow!("{e}: {stderr_buf}"));
+        }
+        Ok(())
     }
 
     #[context("Creating imgstorage")]

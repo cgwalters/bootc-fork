@@ -39,7 +39,8 @@ pub(crate) trait AsyncCommandRunExt {
 }
 
 impl AsyncCommandRunExt for tokio::process::Command {
-    /// Synchronously execute the child, and return an error if the child exited unsuccessfully.
+    /// Asynchronously execute the child, and return an error if the child exited unsuccessfully.
+    /// 
     async fn run(&mut self) -> Result<()> {
         project_status(self.status().await?)
     }
