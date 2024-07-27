@@ -6,19 +6,25 @@
 //! This containers-storage: which canonically lives in `/sysroot/ostree/bootc`.
 
 use std::io::{Read, Seek};
+use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::Arc;
 
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
 use camino::Utf8Path;
+use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::Dir;
-use cap_std_ext::cmdext::CapStdExtCommandExt;
 use cap_std_ext::dirext::CapStdExtDirExt;
 use fn_error_context::context;
-use std::os::fd::OwnedFd;
+use std::os::fd::AsFd;
+use tokio::process::Command as AsyncCommand;
 
-use crate::task::Task;
 use crate::utils::{AsyncCommandRunExt, CommandRunExt};
+
+/// Global directory path which we use for podman to point
+/// it at our storage.
+pub(crate) const STORAGE_ALIAS_DIR: &str = "/run/bootc/storage";
+/// And a similar alias for the runtime state.
+pub(crate) const STORAGE_RUN_ALIAS_DIR: &str = "/run/bootc/run-storage";
 
 /// The path to the storage, relative to the physical system root.
 pub(crate) const SUBPATH: &str = "ostree/bootc/storage";
@@ -35,54 +41,81 @@ pub(crate) struct Storage {
     run: Dir,
 }
 
-impl Storage {
-    fn podman_cmd_in(sysroot: OwnedFd, run: OwnedFd) -> Result<Command> {
-        let mut t = Command::new("podman");
-        // podman expects absolute paths for these, so use /proc/self/fd
-        {
-            let sysroot_fd: Arc<OwnedFd> = Arc::new(sysroot);
-            t.take_fd_n(sysroot_fd, 3);
-        }
-        {
-            let run_fd: Arc<OwnedFd> = Arc::new(run);
-            t.take_fd_n(run_fd, 4);
-        }
-        t.args(["--root=/proc/self/fd/3", "--runroot=/proc/self/fd/4"]);
-        Ok(t)
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PullMode {
+    /// Pull only if the image is not present
+    IfNotExists,
+    /// Always check for an update
+    #[allow(dead_code)]
+    Always,
+}
 
+async fn run_cmd_async(cmd: Command) -> Result<()> {
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let mut stderr = tempfile::tempfile()?;
+    cmd.stderr(stderr.try_clone()?);
+    if let Err(e) = cmd.run().await {
+        stderr.seek(std::io::SeekFrom::Start(0))?;
+        let mut stderr_buf = String::new();
+        // Ignore errors
+        let _ = stderr.read_to_string(&mut stderr_buf);
+        return Err(anyhow::anyhow!("{e}: {stderr_buf}"));
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn bind_storage_roots(cmd: &mut Command, storage_root: &Dir, run_root: &Dir) -> Result<()> {
+    // podman requires an absolute path, for two reasons right now:
+    // - It writes the file paths into `db.sql`, a sqlite database for unknown reasons
+    // - It forks helper binaries, so just giving it /proc/self/fd won't work as
+    //   those helpers may not get the fd passed. (which is also true of skopeo)
+    // We create a new mount namespace, which also has the helpful side effect
+    // of automatically cleaning up the global bind mount that the storage stack
+    // creates.
+    let storage_root = storage_root.try_clone()?;
+    let run_root = run_root.try_clone()?;
+    // SAFETY: All the APIs we call here are safe to invoke between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            use rustix::mount::mount_bind;
+            use rustix::process::fchdir;
+            use rustix::thread::unshare;
+
+            unshare(rustix::thread::UnshareFlags::NEWNS)?;
+            fchdir(storage_root.as_fd())?;
+            mount_bind(".", STORAGE_ALIAS_DIR)?;
+            fchdir(run_root.as_fd())?;
+            mount_bind(".", STORAGE_RUN_ALIAS_DIR)?;
+            // And back to / just by default
+            rustix::process::chdir("/")?;
+            Ok(())
+        })
+    };
+    Ok(())
+}
+
+fn new_podman_cmd_in(storage_root: &Dir, run_root: &Dir) -> Result<Command> {
+    let mut cmd = Command::new("podman");
+    bind_storage_roots(&mut cmd, storage_root, run_root)?;
+    cmd.args([
+        "--root",
+        STORAGE_ALIAS_DIR,
+        "--runroot",
+        STORAGE_RUN_ALIAS_DIR,
+    ]);
+    Ok(cmd)
+}
+
+impl Storage {
     /// Create a `podman image` Command instance prepared to operate on our alternative
     /// root.
     pub(crate) fn new_image_cmd(&self) -> Result<Command> {
-        let sysroot = self.storage_root.try_clone()?.into_std_file().into();
-        let run = self.run.try_clone()?.into_std_file().into();
-        let mut r = Self::podman_cmd_in(sysroot, run)?;
+        let mut r = new_podman_cmd_in(&self.storage_root, &self.run)?;
         // We want to limit things to only manipulating images by default.
         r.arg("image");
         Ok(r)
-    }
-
-    pub(crate) fn new_async_image_cmd(&self) -> Result<tokio::process::Command> {
-        let mut r = tokio::process::Command::from(self.new_image_cmd()?);
-        r.kill_on_drop(true);
-        Ok(r)
-    }
-
-    async fn run_podman_image_async<S>(&self, args: impl IntoIterator<Item = S>) -> Result<()>
-    where
-        S: AsRef<str>,
-    {
-        let mut cmd = self.new_async_image_cmd()?;
-        let mut stderr = tempfile::tempfile()?;
-        cmd.stderr(stderr.try_clone()?);
-        if let Err(e) = cmd.run().await {
-            stderr.seek(std::io::SeekFrom::Start(0))?;
-            let mut stderr_buf = String::new();
-            // Ignore errors
-            let _ = stderr.read_to_string(&mut stderr_buf);
-            return Err(anyhow::anyhow!("{e}: {stderr_buf}"));
-        }
-        Ok(())
     }
 
     #[context("Creating imgstorage")]
@@ -95,12 +128,14 @@ impl Storage {
             sysroot.remove_all_optional(&tmp)?;
             sysroot.create_dir_all(parent)?;
             sysroot.create_dir_all(&tmp).context("Creating tmpdir")?;
+            let storage_root = sysroot.open_dir(&tmp)?;
             // There's no explicit API to initialize a containers-storage:
             // root, simply passing a path will attempt to auto-create it.
             // We run "podman images" in the new root.
-            Self::podman_cmd_in(sysroot.open_dir(&tmp)?.into(), run.try_clone()?.into())?
+            new_podman_cmd_in(&storage_root, &run)?
                 .arg("images")
                 .run()?;
+            drop(storage_root);
             sysroot
                 .rename(&tmp, sysroot, subpath)
                 .context("Renaming tmpdir")?;
@@ -110,10 +145,17 @@ impl Storage {
 
     #[context("Opening imgstorage")]
     pub(crate) fn open(sysroot: &Dir, run: &Dir) -> Result<Self> {
-        let storage_root = sysroot.open_dir(SUBPATH).context(SUBPATH)?;
+        // Ensure our global storage alias dirs exist
+        for d in [STORAGE_ALIAS_DIR, STORAGE_RUN_ALIAS_DIR] {
+            std::fs::create_dir_all(d).with_context(|| format!("Creating {d}"))?;
+        }
+        let storage_root = sysroot
+            .open_dir(SUBPATH)
+            .with_context(|| format!("Opening {SUBPATH}"))?;
         // Always auto-create this if missing
-        run.create_dir_all(RUNROOT)?;
-        let run = run.open_dir(RUNROOT).context(RUNROOT)?;
+        run.create_dir_all(RUNROOT)
+            .with_context(|| format!("Creating {RUNROOT}"))?;
+        let run = run.open_dir(RUNROOT)?;
         Ok(Self {
             sysroot: sysroot.try_clone()?,
             storage_root,
@@ -123,44 +165,43 @@ impl Storage {
 
     /// Fetch the image if it is not already present; return whether
     /// or not the image was fetched.
-    pub(crate) async fn pull(&self, image: &str) -> Result<bool> {
-        // Sadly https://docs.rs/containers-image-proxy/latest/containers_image_proxy/struct.ImageProxy.html#method.open_image_optional
-        // doesn't work with containers-storage yet
-        let mut cmd = self.new_async_image_cmd()?;
-        cmd.args(["exists", image]);
-        let exists = cmd.status().await?.success();
-        if exists {
-            // The image exists, false means we didn't pull it
-            Ok(false)
-        } else {
-            let mut cmd = self.new_async_image_cmd()?;
-            cmd.args(["pull", image]);
-            let authfile = ostree_ext::globals::get_global_authfile(&self.sysroot)?
-                .map(|(authfile, _fd)| authfile);
-            if let Some(authfile) = authfile {
-                cmd.args(["--authfile", authfile.as_str()]);
+    pub(crate) async fn pull(&self, image: &str, mode: PullMode) -> Result<bool> {
+        match mode {
+            PullMode::IfNotExists => {
+                // Sadly https://docs.rs/containers-image-proxy/latest/containers_image_proxy/struct.ImageProxy.html#method.open_image_optional
+                // doesn't work with containers-storage yet
+                let mut cmd = AsyncCommand::from(self.new_image_cmd()?);
+                cmd.args(["exists", image]);
+                let exists = cmd.status().await?.success();
+                if exists {
+                    return Ok(false);
+                }
             }
-            cmd.run().await.context("Failed to pull image")?;
-            Ok(true)
+            PullMode::Always => {}
+        };
+        let mut cmd = self.new_image_cmd()?;
+        cmd.args(["pull", image]);
+        let authfile = ostree_ext::globals::get_global_authfile(&self.sysroot)?
+            .map(|(authfile, _fd)| authfile);
+        if let Some(authfile) = authfile {
+            cmd.args(["--authfile", authfile.as_str()]);
         }
+        run_cmd_async(cmd).await.context("Failed to pull image")?;
+        Ok(true)
     }
 
-    pub(crate) fn pull_from_host_storage(&self, image: &str) -> Result<()> {
-        // The skopeo API expects absolute paths, so we make a temporary bind
-        let temp_mount = crate::mount::TempMount::new(&self.storage_root)?;
-        let temp_mount_path = temp_mount.path();
-        // And an ephemeral place for the transient state
-        let tmp_runroot = tempfile::tempdir()?;
-        let tmp_runroot: &Utf8Path = tmp_runroot.path().try_into()?;
+    pub(crate) async fn pull_from_host_storage(&self, image: &str) -> Result<()> {
+        let mut cmd = Command::new("podman");
+        // An ephemeral place for the transient state
+        let temp_runroot = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        bind_storage_roots(&mut cmd, &self.storage_root, &temp_runroot)?;
 
         // The destination (target stateroot) + container storage dest
-        let storage_dest = &format!("containers-storage:[overlay@{temp_mount_path}+{tmp_runroot}]");
-        Task::new(format!("Copying image to target: {}", image), "podman")
-            .arg("push")
-            .arg(image)
-            .arg(format!("{storage_dest}{image}"))
-            .run()?;
-        temp_mount.close()?;
+        let storage_dest =
+            &format!("containers-storage:[overlay@{STORAGE_ALIAS_DIR}+{STORAGE_RUN_ALIAS_DIR}]");
+        cmd.arg(image).arg(format!("{storage_dest}{image}"));
+        run_cmd_async(cmd).await?;
+        temp_runroot.close()?;
         Ok(())
     }
 }

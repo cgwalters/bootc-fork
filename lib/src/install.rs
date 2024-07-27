@@ -1320,7 +1320,7 @@ async fn install_with_sysroot(
     // Now copy each bound image from the host's container storage into the target.
     for image in bound_images {
         let image = image.image.as_str();
-        sysroot.imgstore.pull_from_host_storage(image)?;
+        sysroot.imgstore.pull_from_host_storage(image).await?;
     }
 
     Ok(())

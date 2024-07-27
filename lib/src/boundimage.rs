@@ -13,6 +13,7 @@ use fn_error_context::context;
 use ostree_ext::containers_image_proxy;
 use ostree_ext::ostree::Deployment;
 
+use crate::imgstorage::PullMode;
 use crate::store::Storage;
 
 /// The path in a root for bound images; this directory should only contain
@@ -141,7 +142,10 @@ pub(crate) async fn pull_images(sysroot: &Storage, bound_images: Vec<BoundImage>
         let image = &bound_image.image;
         let desc = format!("Updating bound image: {image}");
         crate::utils::async_task_with_spinner(&desc, async move {
-            sysroot.imgstore.pull(&bound_image.image).await
+            sysroot
+                .imgstore
+                .pull(&bound_image.image, PullMode::IfNotExists)
+                .await
         })
         .await?;
     }
