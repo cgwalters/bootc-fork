@@ -1,11 +1,13 @@
 //! Helpers for interacting with mountpoints
 
+use std::os::fd::{AsRawFd, BorrowedFd};
+
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
 use fn_error_context::context;
 use serde::Deserialize;
 
-use crate::task::Task;
+use crate::{task::Task, utils::rustix_err_context};
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -87,4 +89,23 @@ pub(crate) fn is_same_as_host(path: &Utf8Path) -> Result<bool> {
         hostdevstat.f_fsid
     );
     Ok(devstat.f_fsid == hostdevstat.f_fsid)
+}
+
+/// Bind mount using a directory file descriptor as a source to the target path.
+/// This is useful for dealing with e.g. subprocess that expect a path and not a
+/// file descriptor (and can't work via /proc/self/fd).
+pub(crate) fn bind_mount_fd(
+    fd: BorrowedFd,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    use rustix::fs::OFlags;
+    let fd = rustix::fs::openat(
+        fd,
+        ".",
+        OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?;
+    let fd = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    rustix_err_context(rustix::mount::mount_bind(&fd, path.as_ref()), "bind")?;
+    Ok(())
 }

@@ -40,7 +40,7 @@ pub(crate) trait AsyncCommandRunExt {
 
 impl AsyncCommandRunExt for tokio::process::Command {
     /// Asynchronously execute the child, and return an error if the child exited unsuccessfully.
-    /// 
+    ///
     async fn run(&mut self) -> Result<()> {
         project_status(self.status().await?)
     }
@@ -57,6 +57,12 @@ pub(crate) fn origin_has_rpmostree_stuff(kf: &glib::KeyFile) -> bool {
         }
     }
     false
+}
+
+/// Helper function to add some basic context to a rustix Result, which is just an errno
+/// value. This also converts to a std::io::Result.
+pub(crate) fn rustix_err_context(r: rustix::io::Result<()>, s: &str) -> std::io::Result<()> {
+    r.map_err(|e| std::io::Error::new(e.kind(), format!("{s}: {e}")))
 }
 
 // Access the file descriptor for a sysroot

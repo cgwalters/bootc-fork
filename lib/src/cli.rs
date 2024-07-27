@@ -4,6 +4,7 @@
 
 use std::ffi::OsString;
 use std::io::Seek;
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -11,6 +12,7 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::Dir;
+use cap_std_ext::cap_tempfile::TempDir;
 use clap::Parser;
 use clap::ValueEnum;
 use fn_error_context::context;
@@ -22,10 +24,12 @@ use ostree_ext::ostree;
 use schemars::schema_for;
 
 use crate::deploy::RequiredHostSpec;
+use crate::imgstorage;
 use crate::lints;
 use crate::spec::Host;
 use crate::spec::ImageReference;
 use crate::utils::sigpolicy_from_opts;
+use crate::utils::CommandRunExt;
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
 
@@ -777,6 +781,11 @@ impl Opt {
 /// Internal (non-generic/monomorphized) primary CLI entrypoint
 async fn run_from_opt(opt: Opt) -> Result<()> {
     let root = &Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+    let td = TempDir::new(cap_std::ambient_authority())?;
+    td.create_dir("sysroot")?;
+    td.create_dir("run")?;
+    let td = imgstorage::Storage::create(&td.open_dir("sysroot")?, &td.open_dir("run")?)?;
+    return Ok(());
     match opt {
         Opt::Upgrade(opts) => upgrade(opts).await,
         Opt::Switch(opts) => switch(opts).await,

@@ -8,6 +8,7 @@
 use std::io::{Read, Seek};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
@@ -18,7 +19,8 @@ use fn_error_context::context;
 use std::os::fd::AsFd;
 use tokio::process::Command as AsyncCommand;
 
-use crate::utils::{AsyncCommandRunExt, CommandRunExt};
+use crate::mount::bind_mount_fd;
+use crate::utils::{rustix_err_context, AsyncCommandRunExt, CommandRunExt};
 
 /// Global directory path which we use for podman to point
 /// it at our storage.
@@ -66,6 +68,7 @@ async fn run_cmd_async(cmd: Command) -> Result<()> {
 }
 
 #[allow(unsafe_code)]
+#[context("Binding storage roots")]
 fn bind_storage_roots(cmd: &mut Command, storage_root: &Dir, run_root: &Dir) -> Result<()> {
     // podman requires an absolute path, for two reasons right now:
     // - It writes the file paths into `db.sql`, a sqlite database for unknown reasons
@@ -74,22 +77,18 @@ fn bind_storage_roots(cmd: &mut Command, storage_root: &Dir, run_root: &Dir) -> 
     // We create a new mount namespace, which also has the helpful side effect
     // of automatically cleaning up the global bind mount that the storage stack
     // creates.
-    let storage_root = storage_root.try_clone()?;
-    let run_root = run_root.try_clone()?;
+
+    let storage_root = Arc::new(storage_root.try_clone().context("Cloning storage root")?);
+    let run_root = Arc::new(run_root.try_clone().context("Cloning runroot")?);
     // SAFETY: All the APIs we call here are safe to invoke between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            use rustix::mount::mount_bind;
-            use rustix::process::fchdir;
             use rustix::thread::unshare;
-
-            unshare(rustix::thread::UnshareFlags::NEWNS)?;
-            fchdir(storage_root.as_fd())?;
-            mount_bind(".", STORAGE_ALIAS_DIR)?;
-            fchdir(run_root.as_fd())?;
-            mount_bind(".", STORAGE_RUN_ALIAS_DIR)?;
+            rustix_err_context(unshare(rustix::thread::UnshareFlags::NEWNS), "unshare").unwrap();
+            bind_mount_fd(storage_root.as_fd(), STORAGE_ALIAS_DIR).unwrap();
+            bind_mount_fd(run_root.as_fd(), STORAGE_RUN_ALIAS_DIR).unwrap();
             // And back to / just by default
-            rustix::process::chdir("/")?;
+            rustix_err_context(rustix::process::chdir("/"), "chdir").unwrap();
             Ok(())
         })
     };
@@ -118,23 +117,38 @@ impl Storage {
         Ok(r)
     }
 
+    fn init_globals() -> Result<()> {
+        // Ensure our global storage alias dirs exist
+        for d in [STORAGE_ALIAS_DIR, STORAGE_RUN_ALIAS_DIR] {
+            std::fs::create_dir_all(d).with_context(|| format!("Creating {d}"))?;
+        }
+        Ok(())
+    }
+
     #[context("Creating imgstorage")]
     pub(crate) fn create(sysroot: &Dir, run: &Dir) -> Result<Self> {
+        Self::init_globals()?;
         let subpath = Utf8Path::new(SUBPATH);
         // SAFETY: We know there's a parent
         let parent = subpath.parent().unwrap();
-        if !sysroot.try_exists(subpath)? {
+        if !sysroot
+            .try_exists(subpath)
+            .with_context(|| format!("Querying {subpath}"))?
+        {
             let tmp = format!("{SUBPATH}.tmp");
-            sysroot.remove_all_optional(&tmp)?;
-            sysroot.create_dir_all(parent)?;
+            sysroot.remove_all_optional(&tmp).context("Removing tmp")?;
+            sysroot
+                .create_dir_all(parent)
+                .with_context(|| format!("Creating {parent}"))?;
             sysroot.create_dir_all(&tmp).context("Creating tmpdir")?;
-            let storage_root = sysroot.open_dir(&tmp)?;
+            let storage_root = sysroot.open_dir(&tmp).context("Open tmp")?;
             // There's no explicit API to initialize a containers-storage:
             // root, simply passing a path will attempt to auto-create it.
             // We run "podman images" in the new root.
             new_podman_cmd_in(&storage_root, &run)?
                 .arg("images")
-                .run()?;
+                .run()
+                .context("Initializing images")?;
             drop(storage_root);
             sysroot
                 .rename(&tmp, sysroot, subpath)
@@ -145,10 +159,7 @@ impl Storage {
 
     #[context("Opening imgstorage")]
     pub(crate) fn open(sysroot: &Dir, run: &Dir) -> Result<Self> {
-        // Ensure our global storage alias dirs exist
-        for d in [STORAGE_ALIAS_DIR, STORAGE_RUN_ALIAS_DIR] {
-            std::fs::create_dir_all(d).with_context(|| format!("Creating {d}"))?;
-        }
+        Self::init_globals()?;
         let storage_root = sysroot
             .open_dir(SUBPATH)
             .with_context(|| format!("Opening {SUBPATH}"))?;
