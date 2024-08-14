@@ -11,7 +11,6 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::install::run_in_host_mountns;
-use crate::task::Task;
 use bootc_utils::CommandRunExt;
 
 #[derive(Debug, Deserialize)]
@@ -82,15 +81,6 @@ impl Device {
         }
         Ok(())
     }
-}
-
-#[context("Failed to wipe {dev}")]
-pub(crate) fn wipefs(dev: &Utf8Path) -> Result<()> {
-    Task::new_and_run(
-        format!("Wiping device {dev}"),
-        "wipefs",
-        ["-a", dev.as_str()],
-    )
 }
 
 #[context("Listing device {dev}")]
@@ -176,10 +166,10 @@ impl Partition {
 
 #[context("Listing partitions of {dev}")]
 pub(crate) fn partitions_of(dev: &Utf8Path) -> Result<PartitionTable> {
-    let o = Task::new_quiet("sfdisk")
+    let o: SfDiskOutput = Command::new("sfdisk")
         .args(["-J", dev.as_str()])
-        .read()?;
-    let o: SfDiskOutput = serde_json::from_str(&o).context("Parsing sfdisk output")?;
+        .run_and_parse_json()
+        .context("Parsing sfdisk output")?;
     Ok(o.partitiontable)
 }
 

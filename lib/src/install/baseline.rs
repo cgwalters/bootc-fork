@@ -158,6 +158,15 @@ fn mkfs<'a>(
     Ok(u)
 }
 
+#[context("Failed to wipe {dev}")]
+fn wipefs(dev: &Utf8Path) -> Result<()> {
+    Task::new_and_run(
+        format!("Wiping device {dev}"),
+        "wipefs",
+        ["-a", dev.as_str()],
+    )
+}
+
 #[context("Creating rootfs")]
 pub(crate) fn install_create_rootfs(
     state: &State,
@@ -184,11 +193,9 @@ pub(crate) fn install_create_rootfs(
         let dev = &opts.device;
         for child in device.children.iter().flatten() {
             let child = child.path();
-            println!("Wiping {child}");
-            crate::blockdev::wipefs(Utf8Path::new(&child))?;
+            wipefs(Utf8Path::new(&child))?;
         }
-        println!("Wiping {dev}");
-        crate::blockdev::wipefs(dev)?;
+        wipefs(dev)?;
     } else if device.has_children() {
         anyhow::bail!(
             "Detected existing partitions on {}; use e.g. `wipefs` if you intend to overwrite",
