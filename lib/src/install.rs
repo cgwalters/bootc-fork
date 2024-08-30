@@ -1216,6 +1216,9 @@ async fn prepare_install(
     // Now, deal with SELinux state.
     let selinux_state = reexecute_self_for_selinux_if_needed(&source, config_opts.disable_selinux)?;
 
+    // More mount namespace setup
+    crate::mount::mount_from_pid1("/dev", &rootfs, "/dev").context("Mounting /dev from host")?;
+
     println!("Installing image: {:#}", &target_imgref);
     if let Some(digest) = source.digest.as_deref() {
         println!("Digest: {digest}");

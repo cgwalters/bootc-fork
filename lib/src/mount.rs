@@ -1,11 +1,18 @@
 //! Helpers for interacting with mountpoints
 
-use std::process::Command;
+use std::{
+    fs::File,
+    os::fd::{AsFd, OwnedFd},
+    path::Path,
+    process::Command,
+};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bootc_utils::CommandRunExt;
 use camino::Utf8Path;
+use cap_std_ext::cap_std::fs::Dir;
 use fn_error_context::context;
+use rustix::mount::{MoveMountFlags, OpenTreeFlags};
 use serde::Deserialize;
 
 use crate::task::Task;
@@ -87,4 +94,53 @@ pub(crate) fn is_same_as_host(path: &Utf8Path) -> Result<bool> {
         hostdevstat.f_fsid
     );
     Ok(devstat.f_fsid == hostdevstat.f_fsid)
+}
+
+/// Open the target mount point in the mount namespace of pid 1, returning
+/// a file descriptor that can be used for relative path lookups.
+pub(crate) fn open_tree_pid1_mountns(p: impl AsRef<Path>) -> Result<OwnedFd> {
+    let p = p.as_ref();
+    // Undefined behavior here, require absolute paths
+    assert!(!p.is_relative());
+    let proc1_ns = "/proc/1/ns/mnt";
+    let pid1_mountns_fd: OwnedFd = File::open(proc1_ns)
+        .with_context(|| format!("Opening {proc1_ns}"))?
+        .into();
+    std::thread::scope(|s| {
+        let fd = s.spawn(move || -> Result<_> {
+            let allowed_types = Some(rustix::thread::LinkNameSpaceType::Mount);
+            rustix::thread::move_into_link_name_space(pid1_mountns_fd.as_fd(), allowed_types)
+                .context("setns")?;
+            let oflags = OpenTreeFlags::OPEN_TREE_CLOEXEC | OpenTreeFlags::OPEN_TREE_CLONE;
+            rustix::mount::open_tree(rustix::fs::CWD, p, oflags).map_err(Into::into)
+        });
+        fd.join().unwrap()
+    })
+}
+
+/// Mount an absolute path from the host/root mount namespace into our namespace.
+pub(crate) fn mount_from_pid1(
+    src: impl AsRef<Path>,
+    dir: &Dir,
+    dest: impl AsRef<Path>,
+) -> Result<()> {
+    let dest = dest.as_ref();
+    let src = open_tree_pid1_mountns(src)?;
+    let flags = MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH;
+    rustix::mount::move_mount(src.as_fd(), "", dir.as_fd(), dest, flags)?;
+    Ok(())
+}
+
+/// Mount an absolute path from the host/root mount namespace into our namespace;
+/// this is a no-op if the filesystem ID is already the same.
+pub(crate) fn mount_from_pid1_idempotent(
+    src: impl AsRef<Path>,
+    dir: &Dir,
+    dest: impl AsRef<Path>,
+) -> Result<()> {
+    let dest = dest.as_ref();
+    let src = open_tree_pid1_mountns(src)?;
+    let flags = MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH;
+    rustix::mount::move_mount(src.as_fd(), "", dir.as_fd(), dest, flags)?;
+    Ok(())
 }
