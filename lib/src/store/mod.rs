@@ -15,6 +15,9 @@ use crate::spec::ImageStatus;
 
 mod ostree_container;
 
+/// The configuration option for fsverity
+pub(crate) const REPO_VERITY_CONFIG: &str = "ex-integrity.fsverity";
+
 pub(crate) struct Storage {
     pub sysroot: SysrootLock,
     run: Dir,

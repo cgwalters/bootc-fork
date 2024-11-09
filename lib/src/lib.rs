@@ -7,6 +7,9 @@
 mod boundimage;
 pub mod cli;
 pub(crate) mod deploy;
+pub(crate) mod fsck;
+#[allow(unsafe_code)]
+pub(crate) mod fsverity;
 pub(crate) mod generator;
 mod image;
 pub(crate) mod journal;

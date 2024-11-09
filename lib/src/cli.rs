@@ -23,9 +23,11 @@ use ostree_ext::ostree;
 use schemars::schema_for;
 
 use crate::deploy::RequiredHostSpec;
+use crate::imgstorage;
 use crate::lints;
 use crate::spec::Host;
 use crate::spec::ImageReference;
+use crate::utils::async_task_with_spinner;
 use crate::utils::sigpolicy_from_opts;
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
@@ -280,6 +282,16 @@ pub(crate) enum ImageOpts {
     Cmd(ImageCmdOpts),
 }
 
+/// Options for consistency checking
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub(crate) enum FsckOpts {
+    /// Check the state of fsverity on the ostree objects. Possible output:
+    /// "enabled" => All .file objects have fsverity
+    /// "disabled" => No .file objects have fsverity
+    /// "inconsistent" => Mixed state
+    OstreeVerity,
+}
+
 /// Hidden, internal only options
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InternalsOpts {
@@ -293,6 +305,9 @@ pub(crate) enum InternalsOpts {
     FixupEtcFstab,
     /// Should only be used by `make update-generated`
     PrintJsonSchema,
+    /// Operate on the global storage
+    #[clap(subcommand)]
+    Storage(StorageOpts),
     /// Perform cleanup actions
     Cleanup,
     /// Proxy frontend for the `ostree-ext` CLI.
@@ -304,6 +319,18 @@ pub(crate) enum InternalsOpts {
     OstreeContainer {
         #[clap(allow_hyphen_values = true)]
         args: Vec<OsString>,
+    },
+}
+
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub(crate) enum StorageOpts {
+    /// Perform consistency checking
+    Fsck,
+    /// Output state of verity or dynamically enable it
+    Verity {
+        /// Change fsverity state to enabled.
+        #[clap(long)]
+        enable: bool,
     },
 }
 
@@ -951,6 +978,33 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                         .chain(args),
                 )
                 .await
+            }
+            InternalsOpts::Storage(opts) => {
+                let storage = get_storage().await?;
+                match opts {
+                    StorageOpts::Fsck => {
+                        let r = crate::fsck::fsck(&storage).await?;
+                        match r.errors.as_slice() {
+                            [] => {}
+                            errs => {
+                                for err in errs {
+                                    eprintln!("error: {err}");
+                                }
+                                anyhow::bail!("fsck found errors");
+                            }
+                        }
+                        Ok(())
+                    }
+                    StorageOpts::Verity { enable } => {
+                        if enable {
+                            let repo = &storage.repo();
+                            async_task_with_spinner("Enabling fsverity",
+                                imgstorage::repo_enable_verity(repo)).await
+                        } else {
+                            todo!()
+                        }
+                    }
+                }
             }
             InternalsOpts::FixupEtcFstab => crate::deploy::fixup_etc_fstab(&root),
             InternalsOpts::PrintJsonSchema => {

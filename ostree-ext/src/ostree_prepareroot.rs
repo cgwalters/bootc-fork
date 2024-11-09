@@ -47,10 +47,14 @@ pub(crate) fn overlayfs_root_enabled(root: &ostree::RepoFile) -> Result<bool> {
     }
 }
 
+/// An option which can be enabled, disabled, or possibly enabled.
 #[derive(Debug, PartialEq, Eq)]
-enum Tristate {
+pub enum Tristate {
+    /// Enabled
     Enabled,
+    /// Disabled
     Disabled,
+    /// Maybe
     Maybe,
 }
 
@@ -66,6 +70,16 @@ impl FromStr for Tristate {
             o => anyhow::bail!("Invalid tristate value: {o}"),
         };
         Ok(r)
+    }
+}
+
+impl AsRef<str> for Tristate {
+    fn as_ref(&self) -> &str {
+        match self {
+            Tristate::Enabled => "yes",
+            Tristate::Disabled => "no",
+            Tristate::Maybe => "maybe"
+        }
     }
 }
 

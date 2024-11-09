@@ -1,12 +1,13 @@
+use std::io::Result;
 use std::os::fd::AsFd;
 
-use anyhow::Result;
 use rustix::ioctl;
 
 use super::FsVerityHashValue;
 
 // See /usr/include/linux/fsverity.h
 #[repr(C)]
+#[allow(dead_code)]
 pub struct FsVerityEnableArg {
     version: u32,
     hash_algorithm: u32,
@@ -20,8 +21,10 @@ pub struct FsVerityEnableArg {
 }
 
 // #define FS_IOC_ENABLE_VERITY    _IOW('f', 133, struct fsverity_enable_arg)
+#[allow(dead_code)]
 type FsIocEnableVerity = ioctl::WriteOpcode<b'f', 133, FsVerityEnableArg>;
 
+#[allow(dead_code)]
 pub fn fs_ioc_enable_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<()> {
     unsafe {
         ioctl::ioctl(
@@ -74,5 +77,22 @@ pub fn fs_ioc_measure_verity<F: AsFd, H: FsVerityHashValue>(fd: F) -> Result<H> 
         Err(std::io::Error::from(std::io::ErrorKind::InvalidData))?
     } else {
         Ok(digest.digest)
+    }
+}
+
+pub(crate) fn fs_ioc_measure_verity_optional<F: AsFd, H: FsVerityHashValue>(
+    fd: F,
+) -> Result<Option<H>> {
+    match fs_ioc_measure_verity(fd) {
+        Ok(r) => Ok(Some(r)),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ENOTTY)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }

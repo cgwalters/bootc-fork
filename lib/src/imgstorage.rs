@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::io::Seek;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -20,8 +21,14 @@ use cap_std_ext::cap_tempfile::TempDir;
 use cap_std_ext::cmdext::CapStdExtCommandExt;
 use cap_std_ext::dirext::CapStdExtDirExt;
 use fn_error_context::context;
-use std::os::fd::OwnedFd;
+use ostree_ext::keyfileext::KeyFileExt;
+use ostree_ext::ostree;
+use ostree_ext::ostree_prepareroot::Tristate;
+use ostree_ext::repoext::RepoExt;
+use std::os::fd::{AsFd, OwnedFd};
 use tokio::process::Command as AsyncCommand;
+
+use crate::fsverity;
 
 // Pass only 100 args at a time just to avoid potentially overflowing argument
 // vectors; not that this should happen in reality, but just in case.
@@ -303,6 +310,36 @@ impl Storage {
         temp_runroot.close()?;
         Ok(())
     }
+}
+
+/// Ensure fsverity is enabled on all regular file objects in an OSTree repository.
+pub(crate) async fn repo_enable_verity(repo: &ostree::Repo) -> Result<()> {
+    let repo = repo.clone();
+    tokio::task::spawn_blocking(move || {
+        repo.traverse_regfile_objects::<(), _>(|name, f| {
+            fsverity::ioctl::fs_ioc_enable_verity::<_, fsverity::Sha256HashValue>(f.as_fd())
+                .with_context(|| format!("Enabling fsverity on object {name}"))?;
+            Ok(std::ops::ControlFlow::Continue(()))
+        })?;
+        let (group, key) = crate::store::REPO_VERITY_CONFIG.split_once('.').unwrap();
+        let config = repo.config();
+        config.set_string(group, key, Tristate::Enabled.as_ref());
+        repo.write_config(&config)?;
+        Ok(())
+    })
+    .await?
+}
+
+/// Query the fsverity enablement state on an OSTree repository
+pub(crate) fn repo_get_fsverity(repo: &ostree::Repo) -> Result<Tristate> {
+    let config = repo.config();
+    let (group, key) = crate::store::REPO_VERITY_CONFIG.split_once('.').unwrap();
+    let r = config
+        .optional_string(group, key)?
+        .map(|v| Tristate::from_str(&v))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(r)
 }
 
 #[cfg(test)]

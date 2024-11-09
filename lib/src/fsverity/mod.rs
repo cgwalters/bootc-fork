@@ -1,4 +1,3 @@
-pub mod digest;
 pub mod ioctl;
 
 pub trait FsVerityHashValue {
