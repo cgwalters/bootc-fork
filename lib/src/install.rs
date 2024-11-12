@@ -513,19 +513,26 @@ impl SourceInfo {
             require_skopeo_with_containers_storage()?;
         }
 
+        let selinux = if Path::new("/ostree/repo").try_exists()? {
+            Self::have_selinux_from_repo(root)?
+        } else {
+            lsm::have_selinux_policy(root)?
+        };
+
         Self::new(
             imageref,
             Some(digest),
             root,
             true,
             have_host_container_storage,
+            selinux,
         )
     }
 
     #[context("Creating source info from a given imageref")]
     pub(crate) fn from_imageref(imageref: &str, root: &Dir) -> Result<Self> {
         let imageref = ostree_container::ImageReference::try_from(imageref)?;
-        Self::new(imageref, None, root, false, false)
+        Self::new(imageref, None, root, false, false, true)
     }
 
     fn have_selinux_from_repo(root: &Dir) -> Result<bool> {
@@ -552,12 +559,8 @@ impl SourceInfo {
         root: &Dir,
         in_host_mountns: bool,
         have_host_container_storage: bool,
+        selinux: bool,
     ) -> Result<Self> {
-        let selinux = if Path::new("/ostree/repo").try_exists()? {
-            Self::have_selinux_from_repo(root)?
-        } else {
-            lsm::have_selinux_policy(root)?
-        };
         Ok(Self {
             imageref,
             digest,
@@ -1252,12 +1255,17 @@ async fn prepare_install(
         println!("Digest: {digest}");
     }
 
-    let install_config = config::load_config()?;
-    if install_config.is_some() {
-        tracing::debug!("Loaded install configuration");
+    let install_config = if external_source {
+        None
     } else {
-        tracing::debug!("No install configuration found");
-    }
+        let install_config = config::load_config()?;
+        if install_config.is_some() {
+            tracing::debug!("Loaded install configuration");
+        } else {
+            tracing::debug!("No install configuration found");
+        }
+        install_config
+    };
 
     // Eagerly read the file now to ensure we error out early if e.g. it doesn't exist,
     // instead of much later after we're 80% of the way through an install.
