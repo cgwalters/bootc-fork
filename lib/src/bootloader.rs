@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use cap_std_ext::cap_std::fs::Dir;
 use fn_error_context::context;
 
 use crate::blockdev::PartitionTable;
@@ -37,6 +38,7 @@ fn get_bootupd_device(device: &PartitionTable) -> Result<Utf8PathBuf> {
 #[context("Installing bootloader")]
 pub(crate) fn install_via_bootupd(
     device: &PartitionTable,
+    src_root: &Dir,
     rootfs: &Utf8Path,
     configopts: &crate::install::InstallConfigOpts,
 ) -> Result<()> {
@@ -49,9 +51,15 @@ pub(crate) fn install_via_bootupd(
         .into_iter()
         .chain(verbose)
         .chain(bootupd_opts.iter().copied().flatten())
-        .chain(["--device", devpath.as_str(), rootfs.as_str()]);
+        .chain([
+            "--src-root=.",
+            "--device",
+            devpath.as_str(),
+            rootfs.as_str(),
+        ]);
     Task::new("Running bootupctl to install bootloader", "bootupctl")
         .args(args)
+        .cwd(src_root)?
         .verbose()
         .run()
 }

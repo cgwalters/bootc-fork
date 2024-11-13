@@ -673,7 +673,7 @@ async fn install_container(
     state: &State,
     root_setup: &RootSetup,
     sysroot: &ostree::Sysroot,
-) -> Result<(ostree::Deployment, InstallAleph)> {
+) -> Result<(ostree::Deployment, Dir, InstallAleph)> {
     let sepolicy = state.load_policy()?;
     let sepolicy = sepolicy.as_ref();
     let stateroot = state.stateroot();
@@ -837,7 +837,7 @@ async fn install_container(
         selinux: state.selinux_state.to_aleph().to_string(),
     };
 
-    Ok((deployment, aleph))
+    Ok((deployment, root, aleph))
 }
 
 /// Run a command in the host mount namespace
@@ -1314,7 +1314,7 @@ async fn install_with_sysroot(
 ) -> Result<()> {
     // And actually set up the container in that root, returning a deployment and
     // the aleph state (see below).
-    let (_deployment, aleph) = install_container(state, rootfs, &sysroot).await?;
+    let (deployment, deployment_root, aleph) = install_container(state, rootfs, &sysroot).await?;
     // Write the aleph data that captures the system state at the time of provisioning for aid in future debugging.
     rootfs
         .rootfs_fd
@@ -1330,6 +1330,7 @@ async fn install_with_sysroot(
     } else {
         crate::bootloader::install_via_bootupd(
             &rootfs.device_info,
+            &deployment_root,
             &rootfs.rootfs,
             &state.config_opts,
         )?;
