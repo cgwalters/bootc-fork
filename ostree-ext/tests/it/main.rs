@@ -5,6 +5,8 @@ use camino::Utf8Path;
 use cap_std::fs::{Dir, DirBuilder, DirBuilderExt};
 use cap_std_ext::cap_std;
 use containers_image_proxy::oci_spec;
+use gvariant::aligned_bytes::TryAsAligned;
+use gvariant::{Marker, Structure};
 use oci_image::ImageManifest;
 use oci_spec::image as oci_image;
 use ocidir::oci_spec::image::{Arch, DigestAlgorithm};
@@ -20,6 +22,7 @@ use ostree_ext::{fixture, ostree_manual};
 use ostree_ext::{gio, glib};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
@@ -221,6 +224,7 @@ struct TarExpected {
     path: &'static str,
     etype: tar::EntryType,
     mode: u32,
+    should_have_security_capability: bool,
 }
 
 #[allow(clippy::from_over_into)]
@@ -230,6 +234,19 @@ impl Into<TarExpected> for (&'static str, tar::EntryType, u32) {
             path: self.0,
             etype: self.1,
             mode: self.2,
+            should_have_security_capability: false,
+        }
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<TarExpected> for (&'static str, tar::EntryType, u32, bool) {
+    fn into(self) -> TarExpected {
+        TarExpected {
+            path: self.0,
+            etype: self.1,
+            mode: self.2,
+            should_have_security_capability: self.3,
         }
     }
 }
@@ -244,7 +261,7 @@ fn validate_tar_expected<T: std::io::Read>(
     let mut seen_paths = HashSet::new();
     // Verify we're injecting directories, fixes the absence of `/tmp` in our
     // images for example.
-    for entry in entries {
+    for mut entry in entries {
         if expected.is_empty() {
             return Ok(());
         }
@@ -265,6 +282,21 @@ fn validate_tar_expected<T: std::io::Read>(
                 header.entry_type(),
                 entry_path
             );
+            if exp.should_have_security_capability {
+                let pax = entry
+                    .pax_extensions()?
+                    .ok_or_else(|| anyhow::anyhow!("Missing pax extensions for {entry_path}"))?;
+                let mut found = false;
+                for ent in pax {
+                    let ent = ent?;
+                    if ent.key_bytes() != b"SCHILY.xattr.security.capability" {
+                        continue;
+                    }
+                    found = true;
+                    break;
+                }
+                assert!(found, "Expected security.capability in {entry_path}");
+            }
         }
     }
 
@@ -312,6 +344,9 @@ fn common_tar_contents_all() -> impl Iterator<Item = TarExpected> {
     ]
     .into_iter()
     .map(Into::into)
+    .chain(std::iter::once(
+        ("sysroot/ostree/repo/objects/0f/49c39f52b33941d8e283f927902d4c10ff5b62e261fe5f4138045a25b26432.file", Regular, 0o755, true).into(),
+    ))
 }
 
 /// Validate metadata (prelude) in a v1 tar.
@@ -932,7 +967,7 @@ async fn test_container_chunked() -> Result<()> {
                 .created_by()
                 .as_ref()
                 .unwrap(),
-            "8 components"
+            "9 components"
         );
     }
     let import = imp.import(prep).await.context("Init pull derived").unwrap();
@@ -991,9 +1026,9 @@ r usr/bin/bash bash-v0
     assert!(second.0.commit.is_none());
     assert_eq!(
         first.1,
-        "ostree export of commit fe4ba8bbd8f61a69ae53cde0dd53c637f26dfbc87717b2e71e061415d931361e"
+        "ostree export of commit a2b98a97aae864c69360010c16c871b087ce2f86e915091caff1c61b824e7f54"
     );
-    assert_eq!(second.1, "8 components");
+    assert_eq!(second.1, "9 components");
 
     assert_eq!(store::list_images(fixture.destrepo()).unwrap().len(), 1);
     let n = store::count_layer_references(fixture.destrepo())? as i64;
@@ -1785,6 +1820,36 @@ async fn test_container_xattr() -> Result<()> {
         _ => unreachable!(),
     };
 
+    // Verify security.capability is in the ostree commit
+    let arping = "/usr/bin/arping";
+    {
+        let ostree_root = fixture
+            .srcrepo()
+            .read_commit(fixture.testref(), gio::Cancellable::NONE)?
+            .0;
+        let arping_ostree = ostree_root.resolve_relative_path(arping);
+        assert_eq!(
+            arping_ostree.query_file_type(
+                gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                gio::Cancellable::NONE
+            ),
+            gio::FileType::Regular
+        );
+        let arping_ostree = arping_ostree.downcast_ref::<ostree::RepoFile>().unwrap();
+        let arping_ostree_xattrs = arping_ostree.xattrs(gio::Cancellable::NONE)?;
+        let v = arping_ostree_xattrs.data_as_bytes();
+        let v = v.try_as_aligned().unwrap();
+        let v = gvariant::gv!("a(ayay)").cast(v);
+        assert!(v
+            .iter()
+            .find(|entry| {
+                let k = entry.to_tuple().0;
+                let k = std::ffi::CStr::from_bytes_with_nul(k).unwrap();
+                k.to_str().ok() == Some("security.capability")
+            })
+            .is_some());
+    }
+
     // Build a derived image
     let derived_path = &fixture.path.join("derived.oci");
     oci_clone(basepath, derived_path).await?;
@@ -1832,6 +1897,8 @@ async fn test_container_xattr() -> Result<()> {
     )
     .read()?;
     assert!(out.contains("'user.foo', [byte 0x62, 0x61, 0x72]"));
+    let out = cmd!(sh, "ostree --repo=dest/repo ls -X {merge_commit} {arping}").read()?;
+    assert!(out.contains("'security.capability'"));
 
     Ok(())
 }

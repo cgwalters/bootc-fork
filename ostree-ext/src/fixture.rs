@@ -8,6 +8,7 @@ use crate::container::{Config, ExportOpts, ImageReference, Transport};
 use crate::objectsource::{ObjectMeta, ObjectSourceMeta};
 use crate::objgv::gv_dirtree;
 use crate::prelude::*;
+use crate::tar::SECURITY_SELINUX_XATTR_C;
 use crate::{gio, glib};
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
@@ -25,6 +26,7 @@ use ocidir::oci_spec::image::ImageConfigurationBuilder;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::borrow::Cow;
+use std::ffi::CString;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::ops::Add;
@@ -47,11 +49,18 @@ enum FileDefType {
 }
 
 #[derive(Debug)]
+struct Xattr {
+    key: CString,
+    value: Box<[u8]>,
+}
+
+#[derive(Debug)]
 pub struct FileDef {
     uid: u32,
     gid: u32,
     mode: u32,
     path: Cow<'static, Utf8Path>,
+    xattrs: Box<[Xattr]>,
     ty: FileDefType,
 }
 
@@ -66,9 +75,21 @@ impl TryFrom<&'static str> for FileDef {
         let name = parts.next().ok_or_else(|| anyhow!("Missing file name"))?;
         let contents = parts.next();
         let contents = move || contents.ok_or_else(|| anyhow!("Missing file contents: {}", value));
-        if parts.next().is_some() {
-            anyhow::bail!("Invalid filedef: {}", value);
-        }
+        let xattrs: Result<Vec<_>> = parts
+            .map(|xattr| -> Result<Xattr> {
+                let (k, v) = xattr
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("Invalid xattr: {xattr}"))?;
+                let mut k: Vec<u8> = k.to_owned().into();
+                k.push(0);
+                let r = Xattr {
+                    key: CString::from_vec_with_nul(k).unwrap(),
+                    value: Vec::from(v.to_owned()).into(),
+                };
+                Ok(r)
+            })
+            .collect();
+        let xattrs = xattrs?.into();
         let ty = match tydef {
             "r" => FileDefType::Regular(contents()?.into()),
             "l" => FileDefType::Symlink(Cow::Borrowed(contents()?.into())),
@@ -80,6 +101,7 @@ impl TryFrom<&'static str> for FileDef {
             gid: 0,
             mode: 0o644,
             path: Cow::Borrowed(name.into()),
+            xattrs,
             ty,
         })
     }
@@ -165,6 +187,7 @@ static OWNERS: Lazy<Vec<(Regex, &str)>> = Lazy::new(|| {
         ("usr/lib/modules/.*/initramfs", "initramfs"),
         ("usr/lib/modules", "kernel"),
         ("usr/bin/(ba)?sh", "bash"),
+        ("usr/bin/arping", "arping"),
         ("usr/lib.*/emptyfile.*", "bash"),
         ("usr/bin/hardlink.*", "testlink"),
         ("usr/etc/someconfig.conf", "someconfig"),
@@ -184,6 +207,7 @@ r usr/lib/modules/5.10.18-200.x86_64/initramfs this-is-an-initramfs
 m 0 0 755
 r usr/bin/bash the-bash-shell
 l usr/bin/sh bash
+r usr/bin/arping arping-binary security.capability=0sAAAAAgAgAAAAAAAAAAAAAAAAAAA=
 m 0 0 644
 # Some empty files
 r usr/lib/emptyfile 
@@ -206,7 +230,7 @@ m 0 0 1755
 d tmp
 "## };
 pub const CONTENTS_CHECKSUM_V0: &str =
-    "acc42fb5c796033f034941dc688643bf8beddfd9068d87165344d2b99906220a";
+    "4449a2b27dd907ffb5e3556018584cfa048edaf3eee4a11ecf21dcd61b6c7a1c";
 // 1 for ostree commit, 2 for max frequency packages, 3 as empty layer
 pub const LAYERS_V0_LEN: usize = 3usize;
 pub const PKGS_V0_LEN: usize = 7usize;
@@ -267,11 +291,10 @@ impl SeLabel {
     }
 
     pub fn xattrs(&self) -> Vec<(&[u8], &[u8])> {
-        vec![(b"security.selinux\0", self.to_str().as_bytes())]
-    }
-
-    pub fn new_xattrs(&self) -> glib::Variant {
-        self.xattrs().to_variant()
+        vec![(
+            SECURITY_SELINUX_XATTR_C.to_bytes_with_nul(),
+            self.to_str().as_bytes(),
+        )]
     }
 }
 
@@ -286,7 +309,7 @@ pub fn create_dirmeta(path: &Utf8Path, selinux: bool) -> glib::Variant {
     } else {
         None
     };
-    let xattrs = label.map(|v| v.new_xattrs());
+    let xattrs = label.map(|v| v.xattrs().to_variant());
     ostree::create_directory_metadata(&finfo, xattrs.as_ref())
 }
 
@@ -632,7 +655,17 @@ impl Fixture {
         } else {
             None
         };
-        let xattrs = label.map(|v| v.new_xattrs());
+        let mut xattrs = label.as_ref().map(|v| v.xattrs()).unwrap_or_default();
+        xattrs.extend(
+            def.xattrs
+                .iter()
+                .map(|xattr| (xattr.key.as_bytes_with_nul(), &xattr.value[..])),
+        );
+        let xattrs = if xattrs.is_empty() {
+            None
+        } else {
+            Some(xattrs.to_variant())
+        };
         let xattrs = xattrs.as_ref();
         let checksum = match &def.ty {
             FileDefType::Regular(contents) => self
